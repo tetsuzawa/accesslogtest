@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/isucon/isucandar/agent"
-	"github.com/labstack/echo/v4/middleware"
 	"github.com/samber/lo"
 )
 
@@ -49,6 +49,7 @@ var (
 	accessLog     string
 	targetURLRaw  string
 	ignoreHeaders string
+	ignoreBodies  string
 
 	// trace id: agent
 	agentPool = make(map[string]*agent.Agent)
@@ -57,7 +58,8 @@ var (
 func main() {
 	flag.StringVar(&accessLog, "accesslog", "./path/to/access.log", "access log file")
 	flag.StringVar(&targetURLRaw, "target-url", "http://localhost:1323/", "target url")
-	flag.StringVar(&ignoreHeaders, "ignore-headers", "Date,Content-Length,Transfer-Encoding", "Comma-separated list of headers to ignoreHeaders")
+	flag.StringVar(&ignoreHeaders, "ignore-headers", "Date,Content-Length,Transfer-Encoding,Connection,Set-Cookie,Server,Vary,Content-Encoding", "Comma-separated list of headers to ignore")
+	flag.StringVar(&ignoreBodies, "ignore-bodies", "sessionId", "Comma-separated list of bodies to ignore")
 	flag.Parse()
 	if strings.HasSuffix(targetURLRaw, "/") {
 		targetURLRaw = targetURLRaw[:len(targetURLRaw)-1]
@@ -65,18 +67,18 @@ func main() {
 
 	f, err := os.Open(accessLog)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open file: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to open file: %v\n", err)
 		return
 	}
 	defer f.Close()
 
 	targetURL, err := url.Parse(targetURLRaw)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to parse url: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to parse url: %v\n", err)
 		return
 	}
 	if targetURL.Scheme != "http" && targetURL.Scheme != "https" {
-		fmt.Fprintf(os.Stderr, "scheme must be http or https, got: %v", targetURL.Scheme)
+		fmt.Fprintf(os.Stderr, "scheme must be http or https, got: %v\n", targetURL.Scheme)
 		return
 	}
 	if targetURL.Host == "" {
@@ -84,13 +86,13 @@ func main() {
 		return
 	}
 	if targetURL.Path != "" {
-		fmt.Fprintf(os.Stderr, "target url path must be / or empty, got: %v", targetURL.Path)
+		fmt.Fprintf(os.Stderr, "target url path must be / or empty, got: %v\n", targetURL.Path)
 		return
 	}
 
 	fstat, err := f.Stat()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get file stat: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to get file stat: %v\n", err)
 		return
 	}
 	fsize := fstat.Size()
@@ -102,6 +104,14 @@ func main() {
 
 		for i := 0; i < len(h); i++ {
 			excludeHeaders[http.CanonicalHeaderKey(strings.Trim(h[i], " "))] = struct{}{}
+		}
+	}
+	excludeBodies := make(map[string]struct{})
+	if ignoreBodies != "" {
+		h := strings.Split(ignoreBodies, ",")
+
+		for i := 0; i < len(h); i++ {
+			excludeBodies[strings.Trim(h[i], " ")] = struct{}{}
 		}
 	}
 
@@ -129,7 +139,7 @@ func main() {
 	//scanner := bufio.NewScanner(f)
 	b, err := io.ReadAll(f)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read file: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to read file: %v\n", err)
 		return
 	}
 	buf := bytes.NewBuffer(b)
@@ -142,14 +152,14 @@ func main() {
 		err = json.Unmarshal([]byte(line), &accessLogLine)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to unmarshal: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to unmarshal: %v\n", err)
 			return
 		}
 
 		ag, err := GetOrNewAgent(accessLogLine.TraceID, agent.WithDefaultTransport(), agent.WithTimeout(120*time.Second))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to GetOrNewAgent: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to GetOrNewAgent: %v\n", err)
 			return
 		}
 		cookieURL := &url.URL{
@@ -161,82 +171,89 @@ func main() {
 		requestBody, err := strconv.Unquote(string(accessLogLine.Request.Body))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v\n", err)
 			return
 		}
 
-		middleware.AddTrailingSlash()
 		bodyBuf := bytes.NewBufferString(requestBody)
 		req, err := ag.NewRequest(accessLogLine.Request.Method, targetURLRaw+accessLogLine.Request.RequestURI, bodyBuf)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to ag.NewRequest: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to ag.NewRequest: %v\n", err)
 			return
+		}
+		for k, vs := range accessLogLine.Request.Header {
+			defaultValues := req.Header.Values(k)
+			for _, v := range vs {
+				if !lo.Contains(defaultValues, v) {
+					req.Header.Add(k, v)
+				}
+			}
 		}
 		res, err := ag.Do(context.Background(), req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to ag.Do: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to ag.Do: %v\n", err)
 			return
 		}
 		resBody, err := io.ReadAll(res.Body)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to ReadAll response body: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to ReadAll response body: %v\n", err)
 			return
 		}
 		res.Body.Close()
 
 		// --------------------------------- validation ---------------------------------
-		var notSameStatusCode bool
-		var notSameHeaders bool
-		var notSameResponseBody bool
+		var isNotSameStatusCode bool
+		var isNotSameHeaders bool
+		var isNotSameResponseBody bool
 
 		if res.StatusCode != accessLogLine.Response.Status {
-			notSameStatusCode = true
+			isNotSameStatusCode = true
 			//fmt.Fprintf(os.Stderr, "status code is not match: %v, %v\n", res.StatusCode, accessLogLine.Response.Status)
 		}
 		unequalHeaders := compareHeaders(res.Header, accessLogLine.Response.Header, excludeHeaders)
 		if len(unequalHeaders) != 0 {
-			notSameHeaders = true
+			isNotSameHeaders = true
 			//fmt.Fprintf(os.Stderr, "header is not match: \n%v, \n%v\n", res.Header, accessLogLine.Response.Header)
 		}
 		unquotedExpectedResBody, err := strconv.Unquote(string(accessLogLine.Response.Body))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v\n", err)
 		}
-		notSameResponseBody, err = jsonEqual(unquotedExpectedResBody, string(resBody))
+		fmt.Printf("unquotedExpectedResBody: \n`%v`\nstring(resBody): \n`%v`\n", unquotedExpectedResBody, string(resBody))
+		isSameResponseBody, err := jsonEqual(unquotedExpectedResBody, string(resBody), excludeBodies)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to jsonEqual: %v", err)
+			fmt.Fprintf(os.Stderr, "failed to jsonEqual: %v\n", err)
 		}
+		isNotSameResponseBody = !isSameResponseBody
 
 		// --------------------------------- output ---------------------------------
-		if notSameStatusCode || notSameHeaders || notSameResponseBody {
+		if isNotSameStatusCode || isNotSameHeaders || isNotSameResponseBody {
 			reqInfo(i+1, accessLogLine)
 		}
-		if notSameStatusCode {
-			vsi(accessLogLine.Response.Status, res.StatusCode, "Different status code: ")
+		if isNotSameStatusCode {
+			printDiffInt(accessLogLine.Response.Status, res.StatusCode, "Different status code: ")
 		}
-		if notSameHeaders {
+		if isNotSameHeaders {
 			for _, h := range unequalHeaders {
-				vs(accessLogLine.Response.Header.Get(h), res.Header.Get(h), "%s header different: ", green(h))
+				printDiff(accessLogLine.Response.Header.Get(h), res.Header.Get(h), "%s header different: ", green(h))
 			}
 		}
-		if notSameResponseBody {
-			if len(resBody) != len(accessLogLine.Response.Body) {
-				vsi(len(accessLogLine.Response.Body), len(resBody), "Different response body length: ")
-			}
-			filenameExpected, err := dumpBodyToTempFile("resbody_expected", string(accessLogLine.Response.Body))
+		if isNotSameResponseBody {
+			fmt.Printf("%v\n", green("Different Response body: "))
+			filenameExpected, err := dumpBodyToTempFile("response_body_expected_", []byte(unquotedExpectedResBody))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to dump response body to temp file: %v", err)
+				fmt.Fprintf(os.Stderr, "failed to dump response body to temp file: %v\n", err)
 			}
-			filenameActual, err := dumpBodyToTempFile("resbody_actual", string(resBody))
+			filenameActual, err := dumpBodyToTempFile("response_body_actual_", resBody)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to dump response body to temp file: %v", err)
+				fmt.Fprintf(os.Stderr, "failed to dump response body to temp file: %v\n", err)
 			}
-			vs(filenameExpected, filenameActual, "Response body files: ")
+			printDiff(filenameExpected, filenameActual, "Response body files: ")
 		}
-		if notSameStatusCode || notSameHeaders || notSameResponseBody {
+		if isNotSameStatusCode || isNotSameHeaders || isNotSameResponseBody {
 			// TODO os.exit(1)
 			return
 		}
@@ -247,38 +264,59 @@ func main() {
 }
 
 func reqInfo(lineNum int, line AccessLogLine) {
-	filename, err := dumpBodyToTempFile("reqbody", string(line.Request.Body))
+	unquotedReqBody, err := strconv.Unquote(string(line.Request.Body))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to dump request body to temp file: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v\n", err)
 	}
 
-	fmt.Printf("line number: %v\n    trace_id: %v\n    request_id: %v\n    request url: %v %v\n    request body file: %v\n",
-		lineNum,
-		line.TraceID,
-		line.RequestID,
-		line.Request.Method,
-		line.Request.RequestURI,
-		filename,
-	)
+	var isBodyEmpty bool
+	filename, err := dumpBodyToTempFile("request_body_", []byte(unquotedReqBody))
+	if errors.Is(err, ErrEmptyBody) {
+		isBodyEmpty = true
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to dump request body to temp file: %v\n", err)
+	}
+	if isBodyEmpty {
+		fmt.Printf("--------- Request Info ---------\naccess log line number: %v\ntrace_id: %v\nrequest_id: %v\nrequest url: %v %v\n--------------------------------\n\n",
+			lineNum,
+			line.TraceID,
+			line.RequestID,
+			line.Request.Method,
+			line.Request.RequestURI,
+		)
+	} else {
+		fmt.Printf("--------- Request Info ---------\naccess log line number: %v\ntrace_id: %v\nrequest_id: %v\nrequest url: %v %v\nrequest body file: %v\n--------------------------------\n\n",
+			lineNum,
+			line.TraceID,
+			line.RequestID,
+			line.Request.Method,
+			line.Request.RequestURI,
+			filename,
+		)
+	}
+
 }
-func dumpBodyToTempFile(filePrefix string, body string) (tmpFilename string, err error) {
-	unquotedBody, err := strconv.Unquote(body)
-	if err != nil {
-		return "", err
+
+var ErrEmptyBody = errors.New("empty body")
+
+func dumpBodyToTempFile(filePrefix string, body []byte) (tmpFilename string, err error) {
+	if string(body) == "" {
+		return "", ErrEmptyBody
 	}
 	f, err := os.CreateTemp("", filePrefix)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer f.Close()
 
 	buf := &bytes.Buffer{}
-	if err := json.Indent(buf, []byte(unquotedBody), "", "  "); err != nil {
-		return "", err
+	if err := json.Indent(buf, body, "", "  "); err != nil {
+		fmt.Printf("body:%v\n", string(body))
+		return "", fmt.Errorf("failed to json.Indent: %w", err)
 	}
 	_, err = f.Write(buf.Bytes())
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to write to temp file: %w", err)
 	}
 	return f.Name(), nil
 }
@@ -317,23 +355,32 @@ func green(s string) string {
 	}
 	return fmt.Sprintf("\x1b[32m%s\x1b[0m", s)
 }
-func vs(a, b string, f string, v ...interface{}) bool {
-	notsame = a != b
-	if notsame {
-		s := fmt.Sprintf(f, v...)
-		fmt.Printf("%s\n    %s\n    %s\n", s, on(0, a), on(1, b))
-	}
-	return notsame
-}
-func vsi(a, b int, f string, v ...interface{}) bool {
-	notsame = a != b
-	if notsame {
-		s := fmt.Sprintf(f, v...)
-		fmt.Printf("%s\n    %s\n    %s\n", s, oni(0, a), oni(1, b))
-	}
-	return notsame
-}
 
+//func vs(a, b string, f string, v ...interface{}) bool {
+//	notsame = a != b
+//	if notsame {
+//		s := fmt.Sprintf(f, v...)
+//		fmt.Printf("%s\n    %s\n    %s\n", s, on(0, a), on(1, b))
+//	}
+//	return notsame
+//}
+//
+//func vsi(a, b int, f string, v ...interface{}) bool {
+//	notsame = a != b
+//	if notsame {
+//		s := fmt.Sprintf(f, v...)
+//		fmt.Printf("%s\n    %s\n    %s\n", s, oni(0, a), oni(1, b))
+//	}
+//	return notsame
+//}
+
+func printDiff(expected, actual string, f string, v ...interface{}) {
+	s := fmt.Sprintf(f, v...)
+	fmt.Printf("%s\n    expected: %s\n    actual  : %s\n", s, on(0, expected), on(1, actual))
+}
+func printDiffInt(expected, actual int, f string, v ...interface{}) {
+	printDiff(fmt.Sprintf("%d", expected), fmt.Sprintf("%d", actual), f, v...)
+}
 func compareHeaders(a, b http.Header, excludeHeaders map[string]struct{}) (unequalHeaders []string) {
 	for key, valA := range a {
 		if _, exclude := excludeHeaders[key]; exclude {
@@ -379,7 +426,7 @@ func slicesEqual(sliceA, sliceB []string) bool {
 }
 
 // 順序を無視してJSONを比較
-func jsonEqual(a, b string) (bool, error) {
+func jsonEqual(a, b string, ignoreBodies map[string]struct{}) (bool, error) {
 	var objA interface{}
 	var objB interface{}
 
@@ -391,30 +438,32 @@ func jsonEqual(a, b string) (bool, error) {
 		return false, err
 	}
 
-	return deepEqual(objA, objB), nil
+	return deepEqual(objA, objB, ignoreBodies, ""), nil
 }
 
 // 順序を無視して要素を比較
-func deepEqual(a, b interface{}) bool {
+func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy string) bool {
 	switch aVal := a.(type) {
 	case []interface{}:
 		bVal, ok := b.([]interface{})
 		if !ok || len(aVal) != len(bVal) {
+			fmt.Println("here 1", keyHierarchy, aVal, bVal)
 			return false
 		}
 
-		// Create a map to count occurrences
-		counts := make(map[interface{}]int)
-		for _, val := range aVal {
-			counts[val]++
-		}
-		for _, val := range bVal {
-			counts[val]--
-		}
-
-		// If any count is non-zero, slices are not equal
-		for _, count := range counts {
-			if count != 0 {
+		// sortするとNlog(N)になるが、uuidなど都度変わる値があるとsortが安定でなくなるため全探索する
+		visited := make([]bool, len(bVal))
+		for _, vA := range aVal {
+			matchFound := false
+			for j, vB := range bVal {
+				if !visited[j] && deepEqual(vA, vB, ignoreBodies, keyHierarchy) {
+					visited[j] = true
+					matchFound = true
+					break
+				}
+			}
+			if !matchFound {
+				fmt.Println("here 7", keyHierarchy, aVal, bVal)
 				return false
 			}
 		}
@@ -422,17 +471,40 @@ func deepEqual(a, b interface{}) bool {
 	case map[string]interface{}:
 		bVal, ok := b.(map[string]interface{})
 		if !ok || len(aVal) != len(bVal) {
+			fmt.Println("here 3", keyHierarchy, aVal, bVal)
 			return false
 		}
 
 		for key, valA := range aVal {
 			valB, exists := bVal[key]
-			if !exists || !deepEqual(valA, valB) {
+			if !exists {
+				fmt.Println("here 4", keyHierarchy, aVal, bVal)
+				return false
+			}
+
+			presentKeyHierarchy := ""
+			if keyHierarchy == "" {
+				presentKeyHierarchy = key
+			} else {
+				presentKeyHierarchy = keyHierarchy + "." + key
+			}
+			fmt.Printf("key: %s, presentKeyHiralchy: %s\n", key, presentKeyHierarchy)
+			if _, ok := ignoreBodies[presentKeyHierarchy]; ok {
+				continue
+			}
+			if !deepEqual(valA, valB, ignoreBodies, presentKeyHierarchy) {
+				fmt.Println("here 5", keyHierarchy, aVal, bVal)
 				return false
 			}
 		}
 		return true
 	default:
+		if _, ok := ignoreBodies[keyHierarchy]; ok {
+			return true
+		}
+		if a != b {
+			fmt.Println("here 6", keyHierarchy, a, b)
+		}
 		return a == b
 	}
 }
