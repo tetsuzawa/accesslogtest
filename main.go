@@ -7,10 +7,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/itchyny/gojq"
+	"github.com/labstack/gommon/color"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,14 +48,20 @@ type Response struct {
 	Body   json.RawMessage `json:"body"`
 }
 
+type AccessContext struct {
+	ag         *agent.Agent
+	modifyData any
+}
+
 var (
 	accessLog     string
 	targetURLRaw  string
 	ignoreHeaders string
 	ignoreBodies  string
+	modifyRaw     string
 
 	// trace id: agent
-	agentPool = make(map[string]*agent.Agent)
+	accessCtxPool = make(map[string]*AccessContext)
 )
 
 func main() {
@@ -60,6 +69,7 @@ func main() {
 	flag.StringVar(&targetURLRaw, "target-url", "http://localhost:1323/", "target url")
 	flag.StringVar(&ignoreHeaders, "ignore-headers", "Date,Content-Length,Transfer-Encoding,Connection,Set-Cookie,Server,Vary,Content-Encoding", "Comma-separated list of headers to ignore")
 	flag.StringVar(&ignoreBodies, "ignore-bodies", "sessionId", "Comma-separated list of bodies to ignore")
+	flag.StringVar(&modifyRaw, "modify", "", "")
 	flag.Parse()
 	if strings.HasSuffix(targetURLRaw, "/") {
 		targetURLRaw = targetURLRaw[:len(targetURLRaw)-1]
@@ -115,6 +125,18 @@ func main() {
 		}
 	}
 
+	// -------------------- modify --------------------
+
+	var modify *Modify
+	fmt.Println("modifyRaw: ", modifyRaw)
+	if modifyRaw != "" {
+		modify, err = ParseModify(modifyRaw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to parse modify: %v\n", err)
+			return
+		}
+	}
+
 	//p := mpb.New(
 	//	mpb.WithWidth(60),
 	//	mpb.WithRefreshRate(180*time.Millisecond),
@@ -156,18 +178,61 @@ func main() {
 			return
 		}
 
-		ag, err := GetOrNewAgent(accessLogLine.TraceID, agent.WithDefaultTransport(), agent.WithTimeout(120*time.Second))
+		accessContext, err := GetOrNewAccessContext(accessLogLine.TraceID, agent.WithDefaultTransport(), agent.WithTimeout(120*time.Second))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
 			fmt.Fprintf(os.Stderr, "failed to GetOrNewAgent: %v\n", err)
 			return
 		}
+
+		// ---------------------------------------- modify ----------------------------------------
+		var replacedRequest Request
+		var requestInterface any
+		if modify != nil && modify.DstPathPattern.MatchString(accessLogLine.Request.RequestURI) {
+			reqB, err := json.Marshal(accessLogLine.Request)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to marshal request: %v\n", err)
+				return
+			}
+			err = json.Unmarshal(reqB, &requestInterface)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to json.Unmarshal: %v\n", err)
+				return
+			}
+			iter := modify.DstQuery.RunWithContext(context.Background(), requestInterface, accessContext.modifyData)
+			replacedRequestInterface, ok := iter.Next()
+			if !ok {
+				// todo failed to parse
+				fmt.Fprintf(os.Stderr, "gojq not ok: %v\n", err)
+				break
+			}
+			if err, ok := replacedRequestInterface.(error); ok {
+				fmt.Fprintf(os.Stderr, "failed to modify: %v\n", err)
+				return
+			}
+			replacedRequestInterfaceB, err := json.Marshal(replacedRequestInterface)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to json.Marshal: %v\n", err)
+				return
+			}
+			err = json.Unmarshal(replacedRequestInterfaceB, &replacedRequest)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to json.Unmarshal: %v\n", err)
+				return
+			}
+			accessLogLine.Request = replacedRequest
+			fmt.Println("header print")
+			fmt.Println(accessLogLine.Request.Header)
+			fmt.Println("modify data print")
+			fmt.Println(accessContext.modifyData)
+		}
+
 		cookieURL := &url.URL{
 			Scheme: targetURL.Scheme,
 			Host:   targetURL.Host + ":" + targetURL.Port(),
 			Path:   "/",
 		}
-		ag.HttpClient.Jar.SetCookies(cookieURL, accessLogLine.Request.Cookies)
+		accessContext.ag.HttpClient.Jar.SetCookies(cookieURL, accessLogLine.Request.Cookies)
 		requestBody, err := strconv.Unquote(string(accessLogLine.Request.Body))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
@@ -176,10 +241,11 @@ func main() {
 		}
 
 		bodyBuf := bytes.NewBufferString(requestBody)
-		req, err := ag.NewRequest(accessLogLine.Request.Method, targetURLRaw+accessLogLine.Request.RequestURI, bodyBuf)
+
+		req, err := accessContext.ag.NewRequest(accessLogLine.Request.Method, targetURLRaw+accessLogLine.Request.RequestURI, bodyBuf)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to ag.NewRequest: %v\n", err)
+			fmt.Fprintf(os.Stderr, "failed to accessContext.NewRequest: %v\n", err)
 			return
 		}
 		for k, vs := range accessLogLine.Request.Header {
@@ -190,10 +256,10 @@ func main() {
 				}
 			}
 		}
-		res, err := ag.Do(context.Background(), req)
+		res, err := accessContext.ag.Do(context.Background(), req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "line number: %v, trace_id: %v, request_id: %v\n", i+1, accessLogLine.TraceID, accessLogLine.RequestID)
-			fmt.Fprintf(os.Stderr, "failed to ag.Do: %v\n", err)
+			fmt.Fprintf(os.Stderr, "failed to accessContext.Do: %v\n", err)
 			return
 		}
 		resBody, err := io.ReadAll(res.Body)
@@ -203,6 +269,35 @@ func main() {
 			return
 		}
 		res.Body.Close()
+
+		// --------------------------------- modify ---------------------------------
+		var body any
+		if resBody != nil && len(resBody) != 0 {
+			err = json.Unmarshal(resBody, &body)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to json.Unmarshal response body: %v\n", err)
+				return
+			}
+		}
+
+		fmt.Println("match srcPathPattern", modify.SrcPathPattern.MatchString(req.URL.Path))
+		fmt.Println("url path", req.URL.Path)
+		if modify != nil && modify.SrcPathPattern.MatchString(req.URL.Path) {
+			fmt.Println("body print")
+			fmt.Printf("%v\n%#v\n", string(resBody), body)
+			iter := modify.SrcQuery.RunWithContext(context.Background(), body)
+			v, ok := iter.Next()
+			if !ok {
+				// todo failed to parse
+				fmt.Fprintf(os.Stderr, "gojq not ok: %v\n", err)
+			}
+			if err, ok := v.(error); ok {
+				fmt.Fprintf(os.Stderr, "failed to modify: %v\n", err)
+				return
+			}
+			fmt.Printf("%v\n%#v\nv:%+v\n", string(resBody), body, v)
+			accessContext.modifyData = v
+		}
 
 		// --------------------------------- validation ---------------------------------
 		var isNotSameStatusCode bool
@@ -222,7 +317,7 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to strconv.Unquote: %v\n", err)
 		}
-		fmt.Printf("unquotedExpectedResBody: \n`%v`\nstring(resBody): \n`%v`\n", unquotedExpectedResBody, string(resBody))
+		//fmt.Printf("unquotedExpectedResBody: \n`%v`\nstring(resBody): \n`%v`\n", unquotedExpectedResBody, string(resBody))
 		isSameResponseBody, err := jsonEqual(unquotedExpectedResBody, string(resBody), excludeBodies)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to jsonEqual: %v\n", err)
@@ -238,11 +333,11 @@ func main() {
 		}
 		if isNotSameHeaders {
 			for _, h := range unequalHeaders {
-				printDiff(accessLogLine.Response.Header.Get(h), res.Header.Get(h), "%s header different: ", green(h))
+				printDiff(accessLogLine.Response.Header.Get(h), res.Header.Get(h), "%s header different: ", color.Red(h))
 			}
 		}
 		if isNotSameResponseBody {
-			fmt.Printf("%v\n", green("Different Response body: "))
+			fmt.Printf("%v\n", color.Red("Different Response body: "))
 			filenameExpected, err := dumpBodyToTempFile("response_body_expected_", []byte(unquotedExpectedResBody))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to dump response body to temp file: %v\n", err)
@@ -321,62 +416,44 @@ func dumpBodyToTempFile(filePrefix string, body []byte) (tmpFilename string, err
 	return f.Name(), nil
 }
 
-func GetOrNewAgent(traceId string, opts ...agent.AgentOption) (*agent.Agent, error) {
+//func GetOrNewAgent(traceId string, opts ...agent.AgentOption) (*agent.Agent, error) {
+//	if traceId == "" {
+//		return agent.NewAgent(opts...)
+//	}
+//	if a, ok := accessCtxPool[traceId]; ok {
+//		return a.Agent, nil
+//	}
+//	ag, err := agent.NewAgent(opts...)
+//	if err != nil {
+//		return nil, err
+//	}
+//	accessCtxPool[traceId] = AccessContext{ag, nil}
+//	return ag, nil
+//}
+
+func GetOrNewAccessContext(traceId string, opts ...agent.AgentOption) (*AccessContext, error) {
 	if traceId == "" {
-		return agent.NewAgent(opts...)
+		ag, err := agent.NewAgent(opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &AccessContext{ag, nil}, nil
 	}
-	if a, ok := agentPool[traceId]; ok {
+	if a, ok := accessCtxPool[traceId]; ok {
 		return a, nil
 	}
 	ag, err := agent.NewAgent(opts...)
 	if err != nil {
 		return nil, err
 	}
-	agentPool[traceId] = ag
-	return ag, nil
+	accessContext := &AccessContext{ag, nil}
+	accessCtxPool[traceId] = accessContext
+	return accessContext, nil
 }
-
-var mono = false
-var notsame = false
-
-// ANSI escape functions and print helpers
-func on(i int, s string) string {
-	if mono {
-		return fmt.Sprintf("%d: %s", i+1, s)
-	}
-	return fmt.Sprintf("\x1b[3%dm%s\x1b[0m", i*3+1, s)
-}
-func oni(i, d int) string {
-	return on(i, fmt.Sprintf("%d", d))
-}
-func green(s string) string {
-	if mono {
-		return fmt.Sprintf("'%s'", s)
-	}
-	return fmt.Sprintf("\x1b[32m%s\x1b[0m", s)
-}
-
-//func vs(a, b string, f string, v ...interface{}) bool {
-//	notsame = a != b
-//	if notsame {
-//		s := fmt.Sprintf(f, v...)
-//		fmt.Printf("%s\n    %s\n    %s\n", s, on(0, a), on(1, b))
-//	}
-//	return notsame
-//}
-//
-//func vsi(a, b int, f string, v ...interface{}) bool {
-//	notsame = a != b
-//	if notsame {
-//		s := fmt.Sprintf(f, v...)
-//		fmt.Printf("%s\n    %s\n    %s\n", s, oni(0, a), oni(1, b))
-//	}
-//	return notsame
-//}
 
 func printDiff(expected, actual string, f string, v ...interface{}) {
 	s := fmt.Sprintf(f, v...)
-	fmt.Printf("%s\n    expected: %s\n    actual  : %s\n", s, on(0, expected), on(1, actual))
+	fmt.Printf("%s\n    expected: %s\n    actual  : %s\n", s, color.Blue(expected), color.Magenta(actual))
 }
 func printDiffInt(expected, actual int, f string, v ...interface{}) {
 	printDiff(fmt.Sprintf("%d", expected), fmt.Sprintf("%d", actual), f, v...)
@@ -447,7 +524,7 @@ func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy 
 	case []interface{}:
 		bVal, ok := b.([]interface{})
 		if !ok || len(aVal) != len(bVal) {
-			fmt.Println("here 1", keyHierarchy, aVal, bVal)
+			//fmt.Println("here 1", keyHierarchy, aVal, bVal)
 			return false
 		}
 
@@ -463,7 +540,7 @@ func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy 
 				}
 			}
 			if !matchFound {
-				fmt.Println("here 7", keyHierarchy, aVal, bVal)
+				//fmt.Println("here 7", keyHierarchy, aVal, bVal)
 				return false
 			}
 		}
@@ -471,14 +548,14 @@ func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy 
 	case map[string]interface{}:
 		bVal, ok := b.(map[string]interface{})
 		if !ok || len(aVal) != len(bVal) {
-			fmt.Println("here 3", keyHierarchy, aVal, bVal)
+			//fmt.Println("here 3", keyHierarchy, aVal, bVal)
 			return false
 		}
 
 		for key, valA := range aVal {
 			valB, exists := bVal[key]
 			if !exists {
-				fmt.Println("here 4", keyHierarchy, aVal, bVal)
+				//fmt.Println("here 4", keyHierarchy, aVal, bVal)
 				return false
 			}
 
@@ -488,12 +565,12 @@ func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy 
 			} else {
 				presentKeyHierarchy = keyHierarchy + "." + key
 			}
-			fmt.Printf("key: %s, presentKeyHiralchy: %s\n", key, presentKeyHierarchy)
+			//fmt.Printf("key: %s, presentKeyHiralchy: %s\n", key, presentKeyHierarchy)
 			if _, ok := ignoreBodies[presentKeyHierarchy]; ok {
 				continue
 			}
 			if !deepEqual(valA, valB, ignoreBodies, presentKeyHierarchy) {
-				fmt.Println("here 5", keyHierarchy, aVal, bVal)
+				//fmt.Println("here 5", keyHierarchy, aVal, bVal)
 				return false
 			}
 		}
@@ -503,8 +580,79 @@ func deepEqual(a, b interface{}, ignoreBodies map[string]struct{}, keyHierarchy 
 			return true
 		}
 		if a != b {
-			fmt.Println("here 6", keyHierarchy, a, b)
+			//fmt.Println("here 6", keyHierarchy, a, b)
 		}
 		return a == b
 	}
+}
+func CompileUriMatchingGroups(groups []string) ([]*regexp.Regexp, error) {
+	uriMatchingGroups := make([]*regexp.Regexp, 0, len(groups))
+	for _, pattern := range groups {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, err
+		}
+		uriMatchingGroups = append(uriMatchingGroups, re)
+	}
+
+	return uriMatchingGroups, nil
+}
+
+type Modify struct {
+	SrcPathPattern *regexp.Regexp
+	DstPathPattern *regexp.Regexp
+	SrcQuery       *gojq.Code
+	DstQuery       *gojq.Code
+}
+
+var ErrModifyEmpty = errors.New("modify is empty")
+
+func ParseModify(raw string) (*Modify, error) {
+	// path regex pattern -> jq query
+	if raw == "" {
+		return nil, ErrModifyEmpty
+	}
+	h := strings.Split(raw, ",")
+	if len(h) != 2 {
+		return nil, fmt.Errorf("invalid modify format: %v", raw)
+	}
+	src := strings.Split(h[0], ":")
+	if len(src) != 2 {
+		return nil, fmt.Errorf("invalid modify format: %v", raw)
+	}
+	srcPathPattern, err := regexp.Compile(src[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile src path pattern: %v", src[0])
+	}
+	srcQuery, err := gojq.Parse(src[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse src query: %v", src[1])
+	}
+	srcCompiledQuery, err := gojq.Compile(srcQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile src query: %v", src[1])
+	}
+	dst := strings.Split(h[1], ":")
+	if len(dst) != 2 {
+		return nil, fmt.Errorf("invalid modify format: %v", raw)
+	}
+	dstPathPattern, err := regexp.Compile(dst[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile dst path pattern: %v", dst[0])
+	}
+	dstQuery, err := gojq.Parse(dst[1] + " = $replacement")
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse dst query: %v", dst[1])
+	}
+	dstCompiledQuery, err := gojq.Compile(dstQuery, gojq.WithVariables([]string{"$replacement"}))
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile dst query: %v", dst[1])
+	}
+
+	return &Modify{
+		SrcPathPattern: srcPathPattern,
+		DstPathPattern: dstPathPattern,
+		SrcQuery:       srcCompiledQuery,
+		DstQuery:       dstCompiledQuery,
+	}, nil
 }

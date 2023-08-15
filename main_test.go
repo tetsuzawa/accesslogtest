@@ -1,6 +1,8 @@
 package main
 
-import "testing"
+import (
+	"testing"
+)
 
 func Test_jsonEqual(t *testing.T) {
 	type args struct {
@@ -143,3 +145,126 @@ func Test_jsonEqual(t *testing.T) {
 		})
 	}
 }
+
+//func TestParseModify(t *testing.T) {
+//	type args struct {
+//		raw string
+//	}
+//	type test struct {
+//		name    string
+//		args    args
+//		want    *Modify
+//		wantErr bool
+//	}
+//	var tests []test
+//
+//	srcQuery, err := gojq.Parse(".headers.sessionId")
+//	if err != nil {
+//		t.Fatalf("gojq.Parse() error = %v", err)
+//	}
+//	compiledSrcQuery, err := gojq.Compile(srcQuery)
+//	if err != nil {
+//		t.Fatalf("gojq.Compile() error = %v", err)
+//	}
+//	dstQuery, err := gojq.Parse(".body.sessionId = $replacement")
+//	if err != nil {
+//		t.Fatalf("gojq.Parse() error = %v", err)
+//	}
+//	compiledDstQuery, err := gojq.Compile(dstQuery, gojq.WithVariables([]string{"$replacement"}))
+//	if err != nil {
+//		t.Fatalf("gojq.Compile() error = %v", err)
+//	}
+//
+//	te := test{
+//		name: "",
+//		args: args{
+//			raw: "/login:.body.sessionId,.*:.headers.sessionId",
+//		},
+//		want: &Modify{
+//			SrcPathPattern: regexp.MustCompile("login"),
+//			DstPathPattern: regexp.MustCompile(".*"),
+//			SrcQuery:       compiledSrcQuery,
+//			DstQuery:       compiledDstQuery,
+//		},
+//		wantErr: false,
+//	}
+//	tests = append(tests, te)
+//	for _, tt := range tests {
+//		t.Run(tt.name, func(t *testing.T) {
+//			got, err := ParseModify(tt.args.raw)
+//			if (err != nil) != tt.wantErr {
+//				t.Errorf("ParseModify() error = %v, wantErr %v", err, tt.wantErr)
+//				return
+//			}
+//			if !reflect.DeepEqual(got, tt.want) {
+//				t.Errorf("ParseModify() got = %+v, want %+v\n", got, tt.want)
+//				t.Errorf("ParseModify() deepequal:%v gotSrcQuery = %v, wantSrcQuery %v\n", reflect.DeepEqual(got.SrcQuery, tt.want.SrcQuery), printStructContent(t, got.SrcQuery), printStructContent(t, tt.want.SrcQuery))
+//				t.Errorf("ParseModify() deepequal:%v gotDstQuery = %v, wantDstQuery %v\n", reflect.DeepEqual(got.SrcQuery, tt.want.SrcQuery), printStructContent(t, got.DstQuery), printStructContent(t, tt.want.DstQuery))
+//			}
+//		})
+//	}
+//}
+//
+//func printStructContent(t *testing.T, s interface{}) string {
+//	v := reflect.ValueOf(s)
+//
+//	if v.Kind() == reflect.Ptr {
+//		v = v.Elem()
+//	}
+//
+//	if v.Kind() != reflect.Struct {
+//		t.Logf("Provided value is not a struct!, got: %v", v.Kind().String())
+//		return ""
+//	}
+//
+//	typ := v.Type()
+//	buf := &strings.Builder{}
+//	for i := 0; i < v.NumField(); i++ {
+//		// Check if the field is exported
+//
+//		field := v.Field(i)
+//		if !field.CanInterface() {
+//			// For unexported fields, print only the name and type.
+//			fmt.Printf("%v (%v): [unexported value]\n", "kotei", field.Type())
+//			continue
+//		}
+//		switch field.Kind() {
+//		case reflect.Ptr:
+//			if !field.IsNil() {
+//				return fmt.Sprintf("%s: %v\n", typ.Field(i).Name, field.Elem().Interface())
+//			} else {
+//				_, err := buf.WriteString(fmt.Sprintf("%s: nil\n", typ.Field(i).Name))
+//				if err != nil {
+//					t.Errorf("buf.WriteString() error = %v", err)
+//				}
+//			}
+//		case reflect.Slice:
+//			_, err := buf.WriteString(fmt.Sprintf("%s: [", typ.Field(i).Name))
+//			if err != nil {
+//				t.Errorf("buf.WriteString() error = %v", err)
+//			}
+//			for j := 0; j < field.Len(); j++ {
+//				if j != 0 {
+//					_, err := buf.WriteString(", ")
+//					if err != nil {
+//						t.Errorf("buf.WriteString() error = %v", err)
+//					}
+//				}
+//				_, err := buf.WriteString(fmt.Sprint(field.Index(j).Interface()))
+//				if err != nil {
+//					t.Errorf("buf.WriteString() error = %v", err)
+//				}
+//			}
+//			_, err = buf.WriteString("]\n")
+//			if err != nil {
+//				t.Errorf("buf.WriteString() error = %v", err)
+//			}
+//		default:
+//			_, err := buf.WriteString(fmt.Sprintf("%s: %v\n", typ.Field(i).Name, field.Interface()))
+//			if err != nil {
+//				t.Errorf("buf.WriteString() error = %v", err)
+//			}
+//		}
+//	}
+//	return buf.String()
+//}
